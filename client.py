@@ -1,1 +1,1 @@
-class Clien: pass
+class Client: pass
