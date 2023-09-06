@@ -1,172 +1,133 @@
-import torch
-from torch import nn, optim
+from torch import nn
+from torch.optim import SGD
+from torch.utils.data import DataLoader
 
-from tsb_data import DatasetController, get_dataloaders
-from tsb_model import TimeSeriesBERTModel, TimeSeriesBERTModelForTraining
+from dataset import MNISTDataset, train_test_dataset_split
+from net import load_model, SimpleModel
 
-dataset_parameters = {
-    "file_path": "dataset/customers_histories.csv",
-    "lm": 3,
-    "mask_prob": 0.15,
-    "train_size": 0.8,
-    "valid_size": 0.1,
-    "test_size": 0.1,
-    "train_dir": "dataset/train/",
-    "valid_dir": "dataset/valid/",
-    "test_dir": "dataset/test/",
-    "rewrite": True,
-}
 
-model_parameters = {
-        "time_series_size": 71,
-        "hidden_size": 128,
-        "encoder_layers_count": 4,
-        "heads_count": 6,
-        "dropout_prob": 0.1,
-    }
 
-trainer_parameters = {
-        "batch_size": 16,
-        "learning_rate": 0.0001,
-        "epoch_num": 20,
-        "k": 10,
-    }
+INPUT_SHAPE = 784
+CLASSES_NUM = 10
+
 
 class Client:
-    def __init__(self, id: str, global_weights_save_folder_path: str = None, local_weights_save_folder_path: str = None):
-        tsb_model = TimeSeriesBERTModel(**model_parameters)
-        model = TimeSeriesBERTModelForTraining(tsb_model)
-        super().__init__(id, model)
+    def __init__(self, id: str, model: SimpleModel, global_weights_save_folder_path: str, local_weights_save_folder_path: str, train_set, test_set):
+        super().__init__(id, model, global_weights_save_folder_path, local_weights_save_folder_path)
+        self.train_set = train_set
+        self.test_set = test_set
 
-        dataset_controller = DatasetController(**dataset_parameters)
+    def get_weights(self, get_weights_ins):
+        weights = self.model.get_weights()
+        return weights
 
-        train_dataset, valid_dataset, test_dataset = dataset_controller.get_sets()
-        self.train_dataloader, self.valid_dataloader, self.test_dataloader = get_dataloaders(
-            batch_size=trainer_parameters["batch_size"],
-            train_dataset=train_dataset,
-            valid_dataset=valid_dataset,
-            test_dataset=test_dataset,
-        )
+    def set_weights(self, weights):
+        self.model.set_weights(weights)
 
-        self.model.init_weights(lambda _x: nn.init.xavier_uniform_(_x))
+    def train(self, train_ins):
+        if train_ins.weights:
+            weights = train_ins.weights
+            self.model.set_weights(weights)
+        config = train_ins.config
+        batch_size = config['batch_size']
+        epochs = config['epochs']
 
-    def get_weights(self, get_weights_ins: GetWeightsInstructions):
-        return self.model.get_weights()
+        lossf = nn.CrossEntropyLoss()
+        dataloader = DataLoader(self.train_set, batch_size=batch_size)
+        optimizer = SGD(self.model.parameters(), lr=0.01, momentum=0.9)
 
-    def set_weights(self, set_weights_ins: SetWeightsInstructions):
-        self.model.set_weights(set_weights_ins.weights)
+        self.model.train()
 
-    def train(self, train_ins: TrainInstructions):
-        epochs_num = trainer_parameters['epochs_num']
-
-        optimizer = optim.AdamW(self.model.parameters(), lr=trainer_parameters["learning_rate"])
-        lossf = TimeSeriesBERTLoss(k=trainer_parameters["k"])
-
-        for epoch in range(epochs_num):
+        for epoch in range(epochs):
             train_loss = 0.0
+            train_correct = 0.0
 
-            self.model.train()
+            for batch_id, data in enumerate(dataloader):
+                images = data['image']
+                labels = data['label'].reshape(-1)
 
-            for batch_id, data in enumerate(self.train_dataloader):
-                data = {key: value.to(self.device) for key, value in data.items()}
-                batch_size = data["input_series"].shape[0]
-                time_series_size = data["input_series"].shape[1]
+                images = images.to(self.device)
+                labels = labels.to(self.device)
 
                 optimizer.zero_grad()
 
-                pred_series = self.model(data["input_series"])
+                output = self.model(images)
 
-                loss, masked_pred, masked_true = lossf(
-                    pred_series,
-                    data["target_series"].reshape(batch_size, time_series_size, 1),
-                    data["mask"].reshape(batch_size, time_series_size, 1),
-                    epoch + 1,
-                )
+                loss = lossf(output, labels)
 
                 loss.backward()
                 optimizer.step()
+
                 train_loss += loss.item()
+                train_correct += (output.max(dim=1).indices == labels).sum()
 
-            train_loss /= len(self.train_dataloader)
+            train_loss /= len(dataloader)
+            train_accuracy = (train_correct * 100) / len(self.train_set)
 
-            return train_loss
+        weights = self.model.get_weights()
+        return train_loss
 
-    def test(self, eval_ins: EvaluateInstructions) -> EvaluateResult:
-        test_loss = 0.0
+    def test(self, eval_ins):
+        weights = eval_ins.weights
+        self.model.set_weights(weights)
 
+        dataloader = DataLoader(self.test_set)
+        lossf = nn.CrossEntropyLoss()
         self.model.eval()
-        lossf = TimeSeriesBERTLoss()
-
-        with torch.no_grad():
-            for batch_id, data in enumerate(self.test_dataloader):
-                data = {key: value.to(self.device) for key, value in data.items()}
-                batch_size = data["input_series"].shape[0]
-                time_series_size = data["input_series"].shape[1]
-
-                pred_series = self.model(data["input_series"])
-
-                loss, masked_pred, masked_true = lossf(
-                    pred_series,
-                    data["target_series"].reshape(batch_size, time_series_size, 1),
-                    data["mask"].reshape(batch_size, time_series_size, 1),
-                )
-
-                test_loss += loss.item()
-
-            test_loss /= len(self.test_dataloader)
-
-            return test_loss
-
-    def get_prediction(self):
         test_loss = 0.0
+        test_correct = 0.0
 
+        for batch_id, data in enumerate(dataloader):
+            images = data['image']
+            labels = data['label'].reshape(-1)
+
+            images = images.to(self.device)
+            labels = labels.to(self.device)
+
+            output = self.model(images)
+
+            loss = lossf(output, labels)
+
+            test_loss += loss.item()
+            test_correct += (output.max(dim=1).indices == labels).sum().item()
+
+        test_loss /= len(dataloader)
+        test_accuracy = test_correct * 100 / len(self.test_set)
+
+        metrics = {'test_loss': test_loss, 'test_accuracy': test_accuracy}
+
+        return metrics
+
+    def get_prediction(self, weights):
+        self.model.set_weights(weights)
+
+        dataloader = DataLoader(self.test_set)
+        lossf = nn.CrossEntropyLoss()
         self.model.eval()
-        lossf = TimeSeriesBERTLoss()
+        test_loss = 0.0
+        test_correct = 0.0
         predictions = []
 
-        with torch.no_grad():
-            for batch_id, data in enumerate(self.test_dataloader):
-                data = {key: value.to(self.device) for key, value in data.items()}
-                batch_size = data["input_series"].shape[0]
-                time_series_size = data["input_series"].shape[1]
+        for batch_id, data in enumerate(dataloader):
+            images = data['image']
+            labels = data['label'].reshape(-1)
 
-                pred_series = self.model(data["input_series"])
-                predictions += list(pred_series)
+            images = images.to(self.device)
+            labels = labels.to(self.device)
 
-            return predictions
+            output = self.model(images)
 
-class TimeSeriesBERTLoss(nn.Module):
-    """
-    TimeSeriesBERTLoss
-    ---------------
+            predictions.append(list(output))
 
-    Loss = (k / epoch_num) * loss_reconstruct + masked_ts_loss
-    loss_reconstruct = MSE(predicted series, true series)
-    masked_ts_loss = RMSE(predicted masked values, true masked values)
+        return predictions
 
-    In Train:
-    returns Loss
-    In Valid/Test:
-    returns masked_ts_loss
-    """
 
-    def __init__(self, k=None):
-        super().__init__()
+def create_client(id, dataset_path, global_weights_save_folder_path: str, local_weights_save_folder_path: str) -> Client:
+    dataset = MNISTDataset(dataset_path=dataset_path)
+    train_set, test_set = train_test_dataset_split(dataset, test_size=0.1)
 
-        self.k = k
-        self.mse_loss = nn.MSELoss(reduction="mean")
+    model = load_model(input_shape=INPUT_SHAPE, classes=CLASSES_NUM)
 
-    def forward(self, y_pred: torch.Tensor, y_true: torch.Tensor, mask: torch.BoolTensor, epoch=None):
-        masked_pred = torch.masked_select(y_pred, mask)
-        masked_true = torch.masked_select(y_true, mask)
+    client = Client(id=id, model=model, global_weights_save_folder_path=global_weights_save_folder_path, local_weights_save_folder_path=local_weights_save_folder_path, train_set=train_set, test_set=test_set)
 
-        masked_ts_loss = torch.sqrt(self.mse_loss(masked_pred, masked_true))
-
-        if epoch is not None:
-            loss_reconstruct = self.mse_loss(y_pred, y_true)
-
-            loss = masked_ts_loss + (self.k / epoch) * loss_reconstruct  # k = 10
-
-            return loss, masked_pred, masked_true
-
-        return masked_ts_loss, masked_pred, masked_true
+    return client
