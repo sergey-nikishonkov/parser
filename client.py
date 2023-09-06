@@ -1,3 +1,5 @@
+import numpy as np
+
 class Client:
     def train(self): pass
     def test(self): pass
