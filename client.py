@@ -12,6 +12,3 @@ class Client:
     def test(self):
         pass
 
-    def get_prediction(self):
-        pass
-
