@@ -4,7 +4,7 @@ class Client:
         pass
 
     def set_weights(self, weighs):
-        return True
+        raise ValueError
 
     def train(self):
         pass
